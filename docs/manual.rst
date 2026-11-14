@@ -228,6 +228,11 @@ The figure above illustrates the difference; the default ``all_touched=False`` i
 while the ``all_touched=True`` option is on the right.
 Both approaches are valid and there are tradeoffs to consider. Using the default rasterizer may miss polygons that are smaller than your cell size resulting in ``None`` stats for those geometries. Using the ``all_touched`` strategy includes many cells along the edges that may not be representative of the geometry and may give severely biased results in some cases.
 
+For an exact alternative that weights every boundary cell by the fraction of
+its area that intersects the region instead of including or dropping the
+whole cell, see :doc:`fractional` (``fractional_stats`` /
+``gen_fractional_stats``).
+
 
 Working with categorical rasters
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

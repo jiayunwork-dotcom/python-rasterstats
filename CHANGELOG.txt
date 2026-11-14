@@ -1,3 +1,19 @@
+Unreleased
+- Add exact area-weighted fractional coverage statistics:
+  `gen_fractional_stats` / `fractional_stats`.
+    - Each raster cell is treated as the real affine-mapped quadrilateral
+      and weighted by its exact intersection-area fraction with each polygon
+      region (planar area; no reprojection or spherical conversion).
+    - Returns coverage, count, nodata, sum, mean, min and max.
+    - NumPy/dataset masks, nodata sentinels, NaN and +/-infinity all count as
+      invalid; explicit nodata cannot cancel an independent dataset mask.
+    - Supports rotated, sheared and negative-axis finite invertible affines.
+    - Windowed processing bounds working memory to O(max_cells); a feature's
+      full bounding box is never read at once and results are independent of
+      max_cells and the file's physical block layout.
+    - Existing `zonal_stats`/`gen_zonal_stats`, `point_query` and CLI behavior
+      and defaults are unchanged.
+
 0.21.0
 - Replace fiona with pyogrio as the default vector io engine #314
     - Binary wheel support for python 3.14

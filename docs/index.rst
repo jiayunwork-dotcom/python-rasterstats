@@ -60,6 +60,7 @@ Next steps
 
   installation
   manual
+  fractional
   cli
   rasterstats
 

@@ -14,3 +14,11 @@ Submodules
    rasterstats.io
    rasterstats.utils
 
+Fractional coverage statistics
+------------------------------
+
+.. automodule:: rasterstats.fractional
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
