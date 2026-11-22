@@ -1,3 +1,23 @@
+Unreleased
+- Add fractional area-weighted zonal statistics (#330)
+    - New `coverage='fractional'` mode for `zonal_stats`/`gen_zonal_stats`
+      with required `value_kind='total'` (whole-cell quantities) or
+      `'density'` (per-unit-area intensities); cells are weighted by their
+      real overlap fraction `a / A` instead of all-or-nothing inclusion.
+    - Returns fractional `count`, `sum`, area-weighted `mean` plus the always
+      present `coverage_area`, `valid_area` and `missing_area` fields.
+    - Supports rotated/sheared/non-square finite invertible affines, holes,
+      overlapping MultiPolygon components (counted once) and planar
+      Polygon/MultiPolygon geometries only; area units are squared CRS units.
+    - `max_cells` (default 65536) bounds every real read window and every
+      materialized 2D working array; large zones are tiled and results are
+      independent of the tile size and the TIFF block layout.
+    - `rio zonalstats` gains `--coverage fractional`, `--value-kind` and
+      `--max-cells`; collection and sequence outputs share the same strict
+      JSON (no NaN/Infinity) statistics and area fields.
+    - In-memory ndarray masks are now preserved through windowed reads.
+    - Ordinary (coverage=None) behavior, stats and options are unchanged.
+
 0.21.0
 - Replace fiona with pyogrio as the default vector io engine #314
     - Binary wheel support for python 3.14

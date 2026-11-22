@@ -159,6 +159,65 @@ due to expensive counting of unique occurrences for each pixel value.
 You can also use a percentile statistic by specifying
 ``percentile_<q>`` where ``<q>`` can be a floating point number between 0 and 100.
 
+Fractional area-weighted statistics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The ordinary cell-inclusion rules (center point, or ``all_touched``) treat
+every raster cell as either fully inside a zone or fully outside it. A cell
+that only overlaps an administrative boundary by a corner is then counted
+the same as a cell that lies wholly inside the zone, which is wrong whenever
+cell values represent quantities or intensities.
+
+Pass ``coverage='fractional'`` to switch to exact area-weighted analysis. For
+a cell of area ``A`` that overlaps the zone over area ``a`` (the coverage
+fraction is ``a / A``)::
+
+    >>> zonal_stats(polygons, raster,
+    ...             coverage='fractional', value_kind='total')  # doctest: +SKIP
+
+You must choose how cell values are interpreted with ``value_kind``:
+
+- ``value_kind='total'``: each cell stores a whole-cell quantity spread
+  uniformly over the cell (for example a population count). The zone total
+  accumulates ``(a / A) * value`` per cell.
+- ``value_kind='density'``: each cell stores a constant per-unit-area
+  intensity (for example people per square coordinate unit). The zone total
+  accumulates ``a * value`` per cell.
+
+In both cases ``mean`` is the area-weighted mean intensity of the zone,
+i.e. ``sum / valid_area``, and ``count`` is the sum of coverage fractions
+(so it can be fractional). The supported statistics are limited to
+``count``, ``sum`` and ``mean`` (the default when ``stats`` is omitted), and
+three area fields are always returned:
+
+- ``coverage_area``: area of the zone that falls inside the raster's outer
+  frame, including cells with no valid observation.
+- ``valid_area``: overlap area of cells that carry a valid observation.
+- ``missing_area``: ``coverage_area - valid_area``, the covered area with no
+  observation (nodata, mask, NaN or +/- infinity).
+
+Area units are the square of the coordinate units, so the raster and the
+geometries must share one planar, projected CRS; reprojection is left to the
+caller. Only ``Polygon`` and ``MultiPolygon`` geometries are accepted. Holes
+are removed, overlapping MultiPolygon components count once, and only
+boundary-touching (zero-area) contact contributes nothing. Rotated, sheared
+and non-square cell affines are supported as long as they are finite and
+invertible.
+
+Large zones are read and processed in tiles rather than by loading the whole
+bounding window. ``max_cells`` (default 65536) bounds both the number of
+cells read in any single window and the size of every materialized 2D working
+array; changing it never changes the results::
+
+    >>> zonal_stats(polygons, raster, coverage='fractional',
+    ...             value_kind='density', max_cells=4096)  # doctest: +SKIP
+
+A total grid and a density grid built as ``total / cell_area`` produce
+identical ``sum`` and ``mean``. See
+``examples/fractional_population_exposure.py`` for a runnable population
+exposure example. On the command line, use ``rio zonalstats --coverage
+fractional --value-kind total|density [--max-cells N]``.
+
 User-defined Statistics
 ^^^^^^^^^^^^^^^^^^^^^^^
 You can define your own aggregate functions using the ``add_stats`` argument.

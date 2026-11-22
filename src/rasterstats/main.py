@@ -1,12 +1,22 @@
+import contextlib
 import inspect
 import sys
 import warnings
 
 import numpy as np
+import rasterio
 from affine import Affine
 from shapely import Geometry
 from shapely.geometry import shape
 
+from rasterstats.fractional import (
+    FRACTIONAL_GDAL_CACHE_BYTES,
+    fractional_zonal_stats,
+    validate_affine,
+    validate_fractional_options,
+    validate_max_cells,
+    validate_polygonal,
+)
 from rasterstats.io import DEFAULT_CHUNK_SIZE, Raster, read_features
 from rasterstats.utils import (
     boxify_points,
@@ -74,6 +84,9 @@ def gen_zonal_stats(
     boundless=True,
     engine=None,
     chunk_size=DEFAULT_CHUNK_SIZE,
+    coverage=None,
+    value_kind=None,
+    max_cells=65536,
     **kwargs,
 ):
     """Zonal statistics of raster values aggregated to vector geometries.
@@ -161,6 +174,33 @@ def gen_zonal_stats(
         Has no effect when ``engine='fiona'`` or when ``vectors`` is not a
         file path.
 
+    coverage: {None, "fractional"}, optional
+        Cell inclusion strategy. ``None`` (the default) keeps the historical
+        behavior: a cell is included wholesale via center-point or
+        ``all_touched`` rasterization. ``"fractional"`` switches to exact
+        area-weighted analysis: every cell is weighted by the fraction
+        ``a / A`` of its area ``A`` that overlaps the zone's area ``a``.
+        Holes are removed and overlapping MultiPolygon components count once.
+        Only planar (projected) Polygon/MultiPolygon geometries and finite,
+        invertible affines are supported; area units are the square of the
+        coordinate units.
+
+    value_kind: {"total", "density"}, optional
+        Required when ``coverage='fractional'`` and forbidden otherwise.
+        ``"total"`` means each cell stores a whole-cell quantity spread
+        uniformly over the cell (e.g. people), so the zone total accumulates
+        ``(a / A) * value``. ``"density"`` means each cell stores a constant
+        per-unit-area intensity (e.g. people per square unit), so the zone
+        total accumulates ``a * value``. In both cases ``mean`` is the
+        area-weighted mean intensity, ``sum / valid_area``.
+
+    max_cells: int, optional
+        Only used with ``coverage='fractional'``. Upper bound on the number
+        of raster cell slots read in any single window and held in any single
+        2D working array. Large zones are tiled; results do not depend on
+        this value. Must be a positive integer and cannot be a bool.
+        Default 65536.
+
     Returns
     -------
     generator of dicts (if geojson_out is False)
@@ -170,7 +210,34 @@ def gen_zonal_stats(
     generator of geojson features (if geojson_out is True)
         GeoJSON-like Feature as python dict
     """
-    stats, run_count = check_stats(stats, categorical)
+    # Fractional area-weighted mode has its own validation rules and code
+    # path; ordinary behavior is untouched when coverage is left as None.
+    fractional = coverage == "fractional"
+    if fractional:
+        stats = validate_fractional_options(
+            coverage,
+            value_kind,
+            stats,
+            categorical,
+            add_stats,
+            zone_func,
+            raster_out,
+            all_touched,
+        )
+        run_count = False
+        max_cells = validate_max_cells(max_cells)
+    else:
+        stats, run_count = check_stats(stats, categorical)
+        validate_fractional_options(
+            coverage,
+            value_kind,
+            stats,
+            categorical,
+            add_stats,
+            zone_func,
+            raster_out,
+            all_touched,
+        )
 
     # Handle 1.0 deprecations
     transform = kwargs.get("transform")
@@ -194,149 +261,47 @@ def gen_zonal_stats(
         warnings.warn("Use `band` to specify band number", DeprecationWarning)
         band = band_num
 
-    with Raster(raster, affine, nodata, band) as rast:
+    # Fractional analysis tiles many small windows; cap GDAL's block cache
+    # before the dataset is opened (the cap is only honored at open time) so
+    # peak RSS stays independent of the number of tiles.
+    env_context = (
+        rasterio.Env(GDAL_CACHEMAX=FRACTIONAL_GDAL_CACHE_BYTES)
+        if fractional
+        else contextlib.nullcontext()
+    )
+    with env_context, Raster(raster, affine, nodata, band) as rast:
+        if fractional:
+            validate_affine(rast.affine)
         features_iter = read_features(vectors, layer, engine=engine, chunk_size=chunk_size)
-        for _, feat in enumerate(features_iter):
+        for feat_index, feat in enumerate(features_iter):
             geom = feat["geometry"]
             if not isinstance(geom, Geometry):
-                geom = shape(geom)
+                geom = shape(geom) if geom is not None else None
 
-            if "Point" in geom.geom_type:
-                geom = boxify_points(geom, rast)
-
-            geom_bounds = tuple(geom.bounds)
-
-            fsrc = rast.read(bounds=geom_bounds, boundless=boundless)
-
-            # rasterized geometry
-            rv_array = rasterize_geom(geom, like=fsrc, all_touched=all_touched)
-
-            # nodata mask
-            isnodata = fsrc.array == fsrc.nodata
-
-            # add nan mask (if necessary)
-            has_nan = np.issubdtype(fsrc.array.dtype, np.floating) and np.isnan(
-                fsrc.array.min()
-            )
-            if has_nan:
-                isnodata = isnodata | np.isnan(fsrc.array)
-
-            # Mask the source data array
-            # mask everything that is not a valid value or not within our geom
-            masked = np.ma.MaskedArray(fsrc.array, mask=(isnodata | ~rv_array))
-
-            # If we're on 64 bit platform and the array is an integer type
-            # make sure we cast to 64 bit to avoid overflow for certain numpy ops
-            if sys.maxsize > 2**32 and issubclass(masked.dtype.type, np.integer):
-                accum_dtype = "int64"
+            if fractional:
+                validate_polygonal(geom, feat_index)
+                feature_stats = fractional_zonal_stats(
+                    geom,
+                    rast,
+                    stats=stats,
+                    value_kind=value_kind,
+                    max_cells=max_cells,
+                )
             else:
-                accum_dtype = None  # numpy default
-
-            # execute zone_func on masked zone ndarray
-            if zone_func is not None:
-                if not callable(zone_func):
-                    raise TypeError(
-                        "zone_func must be a callable function "
-                        "which accepts a single `zone_array` arg."
-                    )
-                value = zone_func(masked)
-
-                # check if zone_func has return statement
-                if value is not None:
-                    masked = value
-
-            if masked.compressed().size == 0:
-                # nothing here, fill with None and move on
-                feature_stats = {stat: None for stat in stats}
-                if "count" in stats:  # special case, zero makes sense here
-                    feature_stats["count"] = 0
-            else:
-                if run_count:
-                    keys, counts = np.unique(masked.compressed(), return_counts=True)
-                    try:
-                        pixel_count = dict(
-                            zip([k.item() for k in keys], [c.item() for c in counts])
-                        )
-                    except AttributeError:
-                        pixel_count = dict(
-                            zip(
-                                [np.asscalar(k) for k in keys],
-                                [np.asscalar(c) for c in counts],
-                            )
-                        )
-
-                if categorical:
-                    feature_stats = dict(pixel_count)
-                    if category_map:
-                        feature_stats = remap_categories(category_map, feature_stats)
-                else:
-                    feature_stats = {}
-
-                if "min" in stats:
-                    feature_stats["min"] = float(masked.min())
-                if "max" in stats:
-                    feature_stats["max"] = float(masked.max())
-                if "mean" in stats:
-                    feature_stats["mean"] = float(masked.mean(dtype=accum_dtype))
-                if "count" in stats:
-                    feature_stats["count"] = int(masked.count())
-                # optional
-                if "sum" in stats:
-                    feature_stats["sum"] = float(masked.sum(dtype=accum_dtype))
-                if "std" in stats:
-                    feature_stats["std"] = float(masked.std())
-                if "median" in stats:
-                    feature_stats["median"] = float(np.median(masked.compressed()))
-                if "majority" in stats:
-                    feature_stats["majority"] = float(key_assoc_val(pixel_count, max))
-                if "minority" in stats:
-                    feature_stats["minority"] = float(key_assoc_val(pixel_count, min))
-                if "unique" in stats:
-                    feature_stats["unique"] = len(list(pixel_count.keys()))
-                if "range" in stats:
-                    try:
-                        rmin = feature_stats["min"]
-                    except KeyError:
-                        rmin = float(masked.min())
-                    try:
-                        rmax = feature_stats["max"]
-                    except KeyError:
-                        rmax = float(masked.max())
-                    feature_stats["range"] = rmax - rmin
-
-                for pctile in [s for s in stats if s.startswith("percentile_")]:
-                    q = get_percentile(pctile)
-                    pctarr = masked.compressed()
-                    feature_stats[pctile] = float(np.percentile(pctarr, q))
-
-            if "nodata" in stats or "nan" in stats:
-                featmasked = np.ma.MaskedArray(fsrc.array, mask=(~rv_array))
-
-                if "nodata" in stats:
-                    feature_stats["nodata"] = float((featmasked == fsrc.nodata).sum())
-                if "nan" in stats:
-                    feature_stats["nan"] = (
-                        float(np.isnan(featmasked).sum()) if has_nan else 0
-                    )
-
-            if add_stats is not None:
-                for stat_name, stat_func in add_stats.items():
-                    n_params = len(inspect.signature(stat_func).parameters.keys())
-                    if n_params == 3:
-                        feature_stats[stat_name] = stat_func(
-                            masked, feat["properties"], rv_array
-                        )
-                    # backwards compatible with two-argument function
-                    elif n_params == 2:
-                        feature_stats[stat_name] = stat_func(masked, feat["properties"])
-                    # backwards compatible with single-argument function
-                    else:
-                        feature_stats[stat_name] = stat_func(masked)
-
-            if raster_out:
-                feature_stats["mini_raster_array"] = masked
-                feature_stats["mini_raster_affine"] = fsrc.affine
-                feature_stats["mini_raster_nodata"] = fsrc.nodata
+                feature_stats = _ordinary_feature_stats(
+                    geom,
+                    rast,
+                    feat,
+                    stats=stats,
+                    run_count=run_count,
+                    all_touched=all_touched,
+                    categorical=categorical,
+                    category_map=category_map,
+                    add_stats=add_stats,
+                    zone_func=zone_func,
+                    raster_out=raster_out,
+                    boundless=boundless,
+                )
 
             if prefix is not None:
                 prefixed_feature_stats = {}
@@ -353,3 +318,158 @@ def gen_zonal_stats(
                 yield feat
             else:
                 yield feature_stats
+
+
+def _ordinary_feature_stats(
+    geom,
+    rast,
+    feat,
+    stats,
+    run_count,
+    all_touched,
+    categorical,
+    category_map,
+    add_stats,
+    zone_func,
+    raster_out,
+    boundless,
+):
+    """Classical center-point / all-touched zonal statistics for one feature."""
+    if "Point" in geom.geom_type:
+        geom = boxify_points(geom, rast)
+
+    geom_bounds = tuple(geom.bounds)
+
+    fsrc = rast.read(bounds=geom_bounds, boundless=boundless)
+
+    # rasterized geometry
+    rv_array = rasterize_geom(geom, like=fsrc, all_touched=all_touched)
+
+    # nodata mask
+    isnodata = fsrc.array == fsrc.nodata
+
+    # add nan mask (if necessary)
+    has_nan = np.issubdtype(fsrc.array.dtype, np.floating) and np.isnan(
+        fsrc.array.min()
+    )
+    if has_nan:
+        isnodata = isnodata | np.isnan(fsrc.array)
+
+    # Mask the source data array
+    # mask everything that is not a valid value or not within our geom
+    masked = np.ma.MaskedArray(fsrc.array, mask=(isnodata | ~rv_array))
+
+    # If we're on 64 bit platform and the array is an integer type
+    # make sure we cast to 64 bit to avoid overflow for certain numpy ops
+    if sys.maxsize > 2**32 and issubclass(masked.dtype.type, np.integer):
+        accum_dtype = "int64"
+    else:
+        accum_dtype = None  # numpy default
+
+    # execute zone_func on masked zone ndarray
+    if zone_func is not None:
+        if not callable(zone_func):
+            raise TypeError(
+                "zone_func must be a callable function "
+                "which accepts a single `zone_array` arg."
+            )
+        value = zone_func(masked)
+
+        # check if zone_func has return statement
+        if value is not None:
+            masked = value
+
+    if masked.compressed().size == 0:
+        # nothing here, fill with None and move on
+        feature_stats = {stat: None for stat in stats}
+        if "count" in stats:  # special case, zero makes sense here
+            feature_stats["count"] = 0
+    else:
+        if run_count:
+            keys, counts = np.unique(masked.compressed(), return_counts=True)
+            try:
+                pixel_count = dict(
+                    zip([k.item() for k in keys], [c.item() for c in counts])
+                )
+            except AttributeError:
+                pixel_count = dict(
+                    zip(
+                        [np.asscalar(k) for k in keys],
+                        [np.asscalar(c) for c in counts],
+                    )
+                )
+
+        if categorical:
+            feature_stats = dict(pixel_count)
+            if category_map:
+                feature_stats = remap_categories(category_map, feature_stats)
+        else:
+            feature_stats = {}
+
+        if "min" in stats:
+            feature_stats["min"] = float(masked.min())
+        if "max" in stats:
+            feature_stats["max"] = float(masked.max())
+        if "mean" in stats:
+            feature_stats["mean"] = float(masked.mean(dtype=accum_dtype))
+        if "count" in stats:
+            feature_stats["count"] = int(masked.count())
+        # optional
+        if "sum" in stats:
+            feature_stats["sum"] = float(masked.sum(dtype=accum_dtype))
+        if "std" in stats:
+            feature_stats["std"] = float(masked.std())
+        if "median" in stats:
+            feature_stats["median"] = float(np.median(masked.compressed()))
+        if "majority" in stats:
+            feature_stats["majority"] = float(key_assoc_val(pixel_count, max))
+        if "minority" in stats:
+            feature_stats["minority"] = float(key_assoc_val(pixel_count, min))
+        if "unique" in stats:
+            feature_stats["unique"] = len(list(pixel_count.keys()))
+        if "range" in stats:
+            try:
+                rmin = feature_stats["min"]
+            except KeyError:
+                rmin = float(masked.min())
+            try:
+                rmax = feature_stats["max"]
+            except KeyError:
+                rmax = float(masked.max())
+            feature_stats["range"] = rmax - rmin
+
+        for pctile in [s for s in stats if s.startswith("percentile_")]:
+            q = get_percentile(pctile)
+            pctarr = masked.compressed()
+            feature_stats[pctile] = float(np.percentile(pctarr, q))
+
+    if "nodata" in stats or "nan" in stats:
+        featmasked = np.ma.MaskedArray(fsrc.array, mask=(~rv_array))
+
+        if "nodata" in stats:
+            feature_stats["nodata"] = float((featmasked == fsrc.nodata).sum())
+        if "nan" in stats:
+            feature_stats["nan"] = (
+                float(np.isnan(featmasked).sum()) if has_nan else 0
+            )
+
+    if add_stats is not None:
+        for stat_name, stat_func in add_stats.items():
+            n_params = len(inspect.signature(stat_func).parameters.keys())
+            if n_params == 3:
+                feature_stats[stat_name] = stat_func(
+                    masked, feat["properties"], rv_array
+                )
+            # backwards compatible with two-argument function
+            elif n_params == 2:
+                feature_stats[stat_name] = stat_func(masked, feat["properties"])
+            # backwards compatible with single-argument function
+            else:
+                feature_stats[stat_name] = stat_func(masked)
+
+    if raster_out:
+        feature_stats["mini_raster_array"] = masked
+        feature_stats["mini_raster_affine"] = fsrc.affine
+        feature_stats["mini_raster_nodata"] = fsrc.nodata
+
+    return feature_stats

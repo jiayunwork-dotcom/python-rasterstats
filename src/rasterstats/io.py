@@ -364,6 +364,13 @@ class Raster:
     def __init__(self, raster, affine=None, nodata=None, band=1):
         self.array = None
         self.src = None
+        # Mask carried by an in-memory MaskedArray; preserved through
+        # windowed reads so downstream code can treat it like a dataset mask.
+        self.parent_mask = None
+        # Optional list that, when set by a caller, receives every rasterio
+        # read window ((row_start, row_stop), (col_start, col_stop)). Intended
+        # for instrumentation/benchmarking; None means no logging overhead.
+        self.read_window_log = None
 
         if isinstance(raster, np.ndarray):
             if affine is None:
@@ -372,6 +379,8 @@ class Raster:
             self.affine = affine
             self.shape = raster.shape
             self.nodata = nodata
+            if np.ma.is_masked(raster):
+                self.parent_mask = np.ma.getmaskarray(raster)
         else:
             self.src = rasterio.open(raster, "r")
             self.affine = guard_transform(self.src.transform)
@@ -425,6 +434,9 @@ class Raster:
                 "Window/bounds is outside dataset extent, boundless reads are disabled"
             )
 
+        if self.read_window_log is not None:
+            self.read_window_log.append(win)
+
         c, _, _, f = window_bounds(win, self.affine)  # c ~ west, f ~ north
         a, b, _, d, e, _, _, _, _ = tuple(self.affine)
         new_affine = Affine(a, b, c, d, e, f)
@@ -444,6 +456,19 @@ class Raster:
             new_array = boundless_array(
                 self.array, window=win, nodata=nodata, masked=masked
             )
+            if self.parent_mask is not None:
+                # Preserve the source array's own validity mask through the
+                # window slice; cells outside the dataset stay unmasked here
+                # and are handled by the caller's nodata/bounds logic.
+                mask_window = boundless_array(
+                    self.parent_mask.astype("uint8"),
+                    window=win,
+                    nodata=0,
+                    masked=False,
+                ).astype(bool)
+                new_array = np.ma.MaskedArray(
+                    np.ma.asarray(new_array).data, mask=mask_window
+                )
         elif self.src:
             # It's an open rasterio dataset
             if all(

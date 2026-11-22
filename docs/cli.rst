@@ -31,6 +31,13 @@ for performing zonal statistics and point_queries at the command line.
     --all-touched / --no-all-touched
     --band INTEGER
     --categorical / --no-categorical
+    --coverage [fractional]         Enable exact area-weighted (fractional
+                                    cell coverage) analysis.
+    --value-kind [total|density]    With --coverage fractional: 'total' cell
+                                    quantities or 'density' per-unit-area
+                                    intensities.
+    --max-cells INTEGER             With --coverage fractional: max raster
+                                    cells read/held per tile.  [default: 65536]
     --indent INTEGER
     --info / --no-info
     --nodata INTEGER
@@ -181,3 +188,23 @@ Rasterization strategy
 ^^^^^^^^^^^^^^^^^^^^^^
 
 As discussed in the main README, the default rasterization of each feature only considers those cells whose *centroids* intersect with the geometry. If you want to include all cells touched by the geometry, even if there is only a small degree of overlap, you can specify the ``--all-touched`` option. This is helpful if your features are much smaller scale than your raster data (e.g. tax lot parcels on a coarse weather data raster)
+
+Fractional area-weighted analysis
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``--all-touched`` and the default center-point rule are still all-or-nothing
+cell decisions. To weight every boundary cell by its real overlap area, pass
+``--coverage fractional`` together with a mandatory ``--value-kind``::
+
+    fio cat districts.geojson | rio zonalstats -r population.tif \
+        --coverage fractional --value-kind total --prefix pop_
+
+``--value-kind total`` treats cell values as whole-cell quantities (e.g.
+people) and accumulates ``fraction * value``; ``--value-kind density`` treats
+them as constant per-unit-area intensities and accumulates
+``overlap_area * value``. Both emit ``count``, ``sum``, the area-weighted
+``mean`` and the ``coverage_area``, ``valid_area`` and ``missing_area``
+fields, with strict JSON (``mean`` is ``null`` rather than ``NaN`` when the
+valid area is zero). ``--max-cells`` bounds the per-tile read and working
+array size for large zones. The same statistics are produced in both the
+default FeatureCollection and ``--sequence`` output.

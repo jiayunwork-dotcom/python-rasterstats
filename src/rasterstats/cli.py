@@ -17,6 +17,26 @@ SETTINGS = dict(help_option_names=["-h", "--help"])
 @click.option("--all-touched/--no-all-touched", default=False)
 @click.option("--band", type=int, default=1)
 @click.option("--categorical/--no-categorical", default=False)
+@click.option(
+    "--coverage",
+    type=click.Choice(["fractional"]),
+    default=None,
+    help="Enable exact area-weighted (fractional cell coverage) analysis.",
+)
+@click.option(
+    "--value-kind",
+    type=click.Choice(["total", "density"]),
+    default=None,
+    help="With --coverage fractional: 'total' cell quantities or "
+    "'density' per-unit-area intensities.",
+)
+@click.option(
+    "--max-cells",
+    type=int,
+    default=65536,
+    show_default=True,
+    help="With --coverage fractional: max raster cells read/held per tile.",
+)
 @click.option("--indent", type=int, default=None)
 @click.option("--info/--no-info", default=False)
 @click.option("--nodata", type=int, default=None)
@@ -30,6 +50,9 @@ def zonalstats(
     all_touched,
     band,
     categorical,
+    coverage,
+    value_kind,
+    max_cells,
     indent,
     info,
     nodata,
@@ -68,20 +91,30 @@ def zonalstats(
         all_touched=all_touched,
         band=band,
         categorical=categorical,
+        coverage=coverage,
+        value_kind=value_kind,
+        max_cells=max_cells,
         nodata=nodata,
         stats=stats,
         prefix=prefix,
         geojson_out=True,
     )
 
+    # Fractional mode never emits NaN/Infinity by construction (mean is null),
+    # but pin the serializer anyway so the JSON contract stays explicit.
+    json_default = dict(ignore_nan=True) if coverage == "fractional" else {}
+
     if sequence:
         for feature in zonal_results:
             if use_rs:
                 click.echo(b"\x1e", nl=False)
-            click.echo(json.dumps(feature))
+            click.echo(json.dumps(feature, **json_default))
     else:
         click.echo(
-            json.dumps({"type": "FeatureCollection", "features": list(zonal_results)})
+            json.dumps(
+                {"type": "FeatureCollection", "features": list(zonal_results)},
+                **json_default,
+            )
         )
 
 
