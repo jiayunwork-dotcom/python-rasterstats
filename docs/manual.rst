@@ -340,6 +340,135 @@ Keep in mind that having ndarrays in your stats dictionary means it is more
 difficult to serialize to json and other text formats.
 
 
+Continuous along-line exposure analysis
+---------------------------------------
+
+The ordinary ``point_query`` samples the raster only at the vertices of a
+geometry. Densifying a polyline's vertices changes the reported values, and
+connecting discrete samples can never establish where a concentration
+threshold is crossed *between* two vertices. Passing a finite real number as
+``exposure`` to :func:`~rasterstats.point_query` (or
+:func:`~rasterstats.gen_point_query`) switches on a different, continuous
+field interpretation instead.
+
+The continuous field
+^^^^^^^^^^^^^^^^^^^^^
+
+* Pixel values are observations located at **cell centers**.
+* On every closed quadrilateral formed by the centers of four cells in two
+  adjacent rows and columns, the field is a bilinear surface interpolated
+  from those four observations.
+* A grid is usable only when all four observations are valid. Nodata values,
+  source masks and non-finite values all invalidate a cell; a legitimate
+  zero stays valid.
+* Outside the union of usable grids, and inside a grid whose four-point
+  support is not fully valid, the field is **unknown**. There is no
+  nearest-neighbor fallback (unlike the historical vertex query).
+* Single-row or single-column rasters have no two-dimensional interpolation
+  grid at all, so the whole route is unknown. The half-cell rim around a
+  raster's edge is likewise unknown.
+
+A bilinear surface restricted to a straight polyline segment is a quadratic
+polynomial in arc length, so threshold crossings are solved from the
+quadratic's exact roots rather than guessed from fixed-step samples, and the
+concentration line integral uses the polynomial's exact antiderivative. A
+threshold may be crossed twice between two input vertices, or merely touched
+at an interior tangency; both are handled correctly. An isolated point where
+the concentration equals the threshold never produces a zero-length record
+and never cuts the surrounding same-kind segment, while an unknown segment
+always separates two known segments.
+
+Inputs and mileage
+^^^^^^^^^^^^^^^^^^
+
+Only ``LineString`` and ``MultiLineString`` geometries are accepted, with
+finite 2D planar coordinates in the same projection as the raster; length
+units are the coordinate units. Each component of a ``MultiLineString`` is
+walked in its input direction with mileage measured from zero at the
+component start, no connector is added between components, and traversing the
+same location twice counts twice. Self-intersecting routes keep the mileage
+of their own branches — nothing is reordered, deduplicated or merged by map
+coordinates. Rotated and sheared (but finite and invertible) affine
+transforms are supported.
+
+Result structure
+^^^^^^^^^^^^^^^^
+
+Each feature yields one dictionary::
+
+    {
+        "parts": [...],          # one entry per input component
+        "total_length": ...,     # full route length
+        "valid_length": ...,     # length with a known concentration
+        "missing_length": ...,   # unknown length
+        "above_length": ...,     # known length strictly above the threshold
+        "integral": ...,         # concentration line integral over known parts
+    }
+
+Every part carries the same five accumulators plus an ``intervals`` list.
+Each interval reports ``start``/``stop`` mileage, a ``kind`` of ``above``,
+``below`` or ``missing``, and the segment's ``integral`` (``None`` for
+missing intervals). Intervals cover the whole component exactly, without
+overlap or gaps, and adjacent same-kind intervals are merged.
+
+A small local example with both known and unknown stretches::
+
+    >>> import numpy as np
+    >>> from affine import Affine
+    >>> from shapely.geometry import LineString
+    >>> from rasterstats import point_query
+    >>> raster = np.ones((5, 5), dtype="float64")
+    >>> route = LineString([(1.6, 2.25), (4.4, 2.25)])  # runs past the grid's edge
+    >>> result = point_query(
+    ...     route, raster, affine=Affine.identity(), exposure=0.5
+    ... )[0]
+    >>> [interval["kind"] for interval in result["parts"][0]["intervals"]]
+    ['above', 'missing']
+    >>> round(result["missing_length"], 3)
+    0.4
+
+Precision and memory
+^^^^^^^^^^^^^^^^^^^^
+
+``distance_tol`` (default ``1e-8``) is the absolute positional error budget
+in length units; it must be a positive finite non-boolean real number. The
+grid walk itself is exact geometry, while threshold roots within
+``distance_tol`` of a piece boundary are treated as sitting on that boundary,
+so reported endpoints and accumulated lengths stay within
+``distance_tol + 1e-10 * route_length``. On large-coordinate datasets the
+1e-10 relative term dominates the budget.
+
+``read_cells`` (default ``4096``, minimum 4, never a bool) bounds both the
+size of every window read and the capacity of a bounded LRU cell cache: the
+route's bounding box is never materialized, the cache never grows with the
+number of visited cells, and features are streamed and delivered one at a
+time. This makes routes far longer than any in-memory clipped image
+practical. Because crossings are solved analytically per grid piece, even a
+shorter-than-sample above segment cannot be missed — fixed-step sampling
+provides no such guarantee.
+
+Command line
+^^^^^^^^^^^^
+
+``rio pointquery`` gains ``--exposure``, ``--distance-tol`` and
+``--read-cells`` options. With exposure enabled, the output changes from one
+record per input feature (with a ``value`` property) to one GeoJSON Feature
+per classified segment: each record's geometry is the original route clipped
+to that segment's mileage range (intermediate turns preserved, length equal
+to ``stop - start``), carrying the original feature properties plus
+``feature_index``, ``part_index``, ``start``, ``stop``, ``kind`` and
+``integral`` (missing segments are emitted with a null integral). Both
+FeatureCollection and ``--sequence`` output express the same segments and the
+JSON never contains NaN or Infinity tokens. The Python ``geojson_out=True``
+path keeps the original feature geometry unchanged and nests the full
+analysis dictionary under ``property_name``.
+
+Re-run the continuous analysis tests and the long-route benchmark with::
+
+    python -m pytest tests/test_exposure.py tests/test_cli_exposure.py -q
+    python scripts/bench_exposure.py
+
+
 Design Goals
 ------------
 

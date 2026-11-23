@@ -2,6 +2,12 @@ from numpy.ma import masked
 from shapely.geometry import shape
 from shapely.ops import transform
 
+from rasterstats.exposure import (
+    analyze_geometry,
+    validate_distance_tol,
+    validate_exposure_threshold,
+    validate_read_cells,
+)
 from rasterstats.io import DEFAULT_CHUNK_SIZE, Raster, read_features
 
 
@@ -111,6 +117,9 @@ def gen_point_query(
     boundless=True,
     engine=None,
     chunk_size=DEFAULT_CHUNK_SIZE,
+    exposure=None,
+    distance_tol=1e-8,
+    read_cells=4096,
 ):
     """
     Given a set of vector features and a raster,
@@ -149,7 +158,9 @@ def gen_point_query(
         required only for ndarrays, otherwise it is read from src
 
     interpolate: string
-        'bilinear' or 'nearest' interpolation
+        'bilinear' or 'nearest' interpolation. The continuous exposure mode
+        defines its own bilinear field and cannot be combined with
+        ``interpolate='nearest'``.
 
     property_name: string
         name of property key if geojson_out
@@ -158,6 +169,8 @@ def gen_point_query(
         generate GeoJSON-like features (default: False)
         original feature geometry and properties will be retained
         point query values appended as additional properties.
+        In exposure mode the full analysis dict is stored under this key
+        and the original geometry is retained unchanged.
 
     boundless: boolean
         Allow features that extend beyond the raster dataset's extent, default: True
@@ -176,6 +189,29 @@ def gen_point_query(
         Has no effect when ``engine='fiona'`` or when ``vectors`` is not a
         file path.
 
+    exposure: float, optional
+        None (default) keeps the historical vertex sampling behavior.
+        A finite real-valued threshold enables continuous along-line
+        exposure analysis: only LineString/MultiLineString inputs are
+        accepted, the raster field is reconstructed by bilinear
+        interpolation on closed grids of four valid cell centers, and each
+        feature yields a dict with ``parts`` (per component, mileage measured
+        from the component start), ``total_length``, ``valid_length``,
+        ``missing_length``, ``above_length`` and the concentration line
+        ``integral`` over all known parts. Booleans are not accepted.
+
+    distance_tol: float, optional
+        Absolute upper bound on positional error in coordinate-length units,
+        default 1e-8. Must be a positive finite non-boolean real. Reported
+        mileage endpoints and accumulated lengths stay within
+        ``distance_tol + 1e-10 * route_length`` of the exact values.
+
+    read_cells: int, optional
+        Capacity, in raster cell slots, of each window read and of the
+        bounded LRU cell cache used by the continuous mode, default 4096.
+        Must be an integer no smaller than 4 and never a bool. The route's
+        bounding box is never materialized.
+
     Returns
     -------
     generator of arrays (if ``geojson_out`` is False)
@@ -184,11 +220,45 @@ def gen_point_query(
     if interpolate not in ["nearest", "bilinear"]:
         raise ValueError("interpolate must be nearest or bilinear")
 
+    # Validate every new option before any data source is opened so that bad
+    # arguments fail before any result is produced.
+    exposure = validate_exposure_threshold(exposure)
+    if exposure is not None:
+        if interpolate == "nearest":
+            raise ValueError(
+                "interpolate='nearest' is not compatible with continuous "
+                "exposure analysis; use the default bilinear field"
+            )
+        distance_tol = validate_distance_tol(distance_tol)
+        read_cells = validate_read_cells(read_cells)
+
     features_iter = read_features(vectors, layer, engine=engine, chunk_size=chunk_size)
 
     with Raster(raster, nodata=nodata, affine=affine, band=band) as rast:
-        for feat in features_iter:
+        for feat_index, feat in enumerate(features_iter):
             geom = shape(feat["geometry"])
+
+            if exposure is not None:
+                analysis = analyze_geometry(
+                    geom,
+                    rast,
+                    threshold=exposure,
+                    distance_tol=distance_tol,
+                    read_cells=read_cells,
+                    feature_index=feat_index,
+                )
+                # the cell cache is an implementation detail of the result
+                analysis.pop("_cache", None)
+
+                if geojson_out:
+                    if "properties" not in feat:
+                        feat["properties"] = {}
+                    feat["properties"][property_name] = analysis
+                    yield feat
+                else:
+                    yield analysis
+                continue
+
             vals = []
             for x, y in geom_xys(geom):
                 if interpolate == "nearest":

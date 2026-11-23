@@ -1,4 +1,35 @@
 Unreleased
+- Add continuous along-line exposure analysis to point_query
+    - New `exposure=<finite threshold>` mode for `point_query`/
+      `gen_point_query`; `exposure=None` (default) keeps the historical
+      vertex sampler and its return shape unchanged.
+    - Pixel values are observations at cell centers; the field is bilinear on
+      every closed grid of four valid centers and unknown (not nearest-
+      neighbor interpolated) outside usable grids and where nodata, source
+      masks or non-finite values break the four-point support. Zero is valid.
+    - Restricted to a polyline the bilinear field is a quadratic in arc
+      length, so threshold crossings and the concentration line integral are
+      solved analytically per grid piece: double crossings between vertices
+      and interior tangencies are exact, and no fixed sampling step is used.
+    - Only LineString/MultiLineString inputs with finite 2D coordinates are
+      accepted; components keep independent zero-based mileage, repeated
+      traversal counts twice and no connectors are added between components.
+      Rotated/sheared finite invertible affines are supported.
+    - Returns `parts` (per component: five accumulators plus `intervals`
+      with `start`, `stop`, `kind` in above/below/missing and `integral`),
+      feature-level `total_length`, `valid_length`, `missing_length`,
+      `above_length` and the known-part concentration `integral`.
+    - `distance_tol` (default 1e-8, positive finite non-bool real) bounds
+      mileage error by `distance_tol + 1e-10 * route_length`; `read_cells`
+      (default 4096, integer >= 4, never bool) bounds every window read and
+      the LRU cell cache, so routes far longer than memory are streamed
+      without materializing their bounding box.
+    - `rio pointquery` gains `--exposure`, `--distance-tol` and
+      `--read-cells`; enabled output is one GeoJSON feature per classified
+      segment clipped from the original route (turns preserved, length equal
+      to `stop - start`), including missing segments, with strict JSON.
+    - Python `geojson_out=True` keeps the original geometry and nests the
+      full analysis dict under `property_name`.
 - Add fractional area-weighted zonal statistics (#330)
     - New `coverage='fractional'` mode for `zonal_stats`/`gen_zonal_stats`
       with required `value_kind='total'` (whole-cell quantities) or

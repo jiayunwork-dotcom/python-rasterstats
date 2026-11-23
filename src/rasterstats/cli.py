@@ -3,9 +3,11 @@ import logging
 import click
 import cligj
 import simplejson as json
+from shapely.geometry import shape
 
 from rasterstats import gen_point_query, gen_zonal_stats
 from rasterstats._version import __version__ as version
+from rasterstats.exposure import cut_line_coordinates, line_components
 
 SETTINGS = dict(help_option_names=["-h", "--help"])
 
@@ -118,6 +120,49 @@ def zonalstats(
         )
 
 
+def _iter_exposure_records(results, distance_tol, property_name):
+    """Turn exposure-mode features into one GeoJSON record per interval.
+
+    Each record's geometry is the original component clipped to the interval's
+    mileage range, so intermediate turns are retained and its length equals
+    ``stop - start``. Original feature properties are carried along; any
+    property sharing a name with a result key is overridden by the result.
+    """
+    for feature_index, feature in enumerate(results):
+        properties = dict(feature.get("properties") or {})
+        analysis = properties.pop(property_name)
+        geom = shape(feature["geometry"])
+        components = line_components(geom, feature_index)
+        for part_index, part in enumerate(analysis["parts"]):
+            coords = components[part_index]
+            for interval in part["intervals"]:
+                clipped = cut_line_coordinates(
+                    coords,
+                    interval["start"],
+                    interval["stop"],
+                    distance_tol,
+                )
+                record_props = dict(properties)
+                record_props.update(
+                    {
+                        "feature_index": feature_index,
+                        "part_index": part_index,
+                        "start": interval["start"],
+                        "stop": interval["stop"],
+                        "kind": interval["kind"],
+                        "integral": interval["integral"],
+                    }
+                )
+                yield {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [list(point) for point in clipped],
+                    },
+                    "properties": record_props,
+                }
+
+
 @click.command(context_settings=SETTINGS)
 @cligj.features_in_arg
 @click.version_option(version=version, message="%(version)s")
@@ -127,10 +172,43 @@ def zonalstats(
 @click.option("--indent", type=int, default=None)
 @click.option("--interpolate", type=str, default="bilinear")
 @click.option("--property-name", type=str, default="value")
+@click.option(
+    "--exposure",
+    type=float,
+    default=None,
+    help="Finite concentration threshold; enables continuous along-line "
+    "exposure analysis for LineString/MultiLineString inputs and emits one "
+    "GeoJSON feature per classified route segment.",
+)
+@click.option(
+    "--distance-tol",
+    type=float,
+    default=1e-8,
+    show_default=True,
+    help="Absolute positional error budget in route length units.",
+)
+@click.option(
+    "--read-cells",
+    type=int,
+    default=4096,
+    show_default=True,
+    help="Maximum raster cell slots per window read and in the bounded cell cache.",
+)
 @click.option("--sequence/--no-sequence", type=bool, default=False)
 @cligj.use_rs_opt
 def pointquery(
-    features, raster, band, indent, nodata, interpolate, property_name, sequence, use_rs
+    features,
+    raster,
+    band,
+    indent,
+    nodata,
+    interpolate,
+    property_name,
+    exposure,
+    distance_tol,
+    read_cells,
+    sequence,
+    use_rs,
 ):
     """
     Queries the raster values at the points of the input GeoJSON Features.
@@ -143,6 +221,11 @@ def pointquery(
     if the vertices are spaced properly.
 
     You can use either bilinear (default) or nearest neighbor interpolation.
+
+    With --exposure, the point sampler is replaced by continuous along-line
+    exposure analysis: the output becomes one GeoJSON Feature per classified
+    segment (above, below, missing), each clipped from the original route,
+    carrying feature_index, part_index, start, stop, kind and integral.
     """
 
     results = gen_point_query(
@@ -153,7 +236,29 @@ def pointquery(
         interpolate=interpolate,
         property_name=property_name,
         geojson_out=True,
+        exposure=exposure,
+        distance_tol=distance_tol,
+        read_cells=read_cells,
     )
+
+    if exposure is not None:
+        records = _iter_exposure_records(results, distance_tol, property_name)
+        # strict JSON: the analysis can legitimately contain nulls but never
+        # NaN or Infinity tokens
+        dump_kwargs = dict(ignore_nan=True)
+        if sequence:
+            for record in records:
+                if use_rs:
+                    click.echo(b"\x1e", nl=False)
+                click.echo(json.dumps(record, **dump_kwargs))
+        else:
+            click.echo(
+                json.dumps(
+                    {"type": "FeatureCollection", "features": list(records)},
+                    **dump_kwargs,
+                )
+            )
+        return
 
     if sequence:
         for feature in results:

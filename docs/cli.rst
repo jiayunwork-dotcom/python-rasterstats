@@ -78,6 +78,14 @@ for performing zonal statistics and point_queries at the command line.
     --indent INTEGER
     --interpolate TEXT
     --property-name TEXT
+    --exposure FLOAT            Finite concentration threshold; enables
+                                continuous along-line exposure analysis for
+                                LineString/MultiLineString inputs and emits
+                                one GeoJSON feature per classified segment.
+    --distance-tol FLOAT        Absolute positional error budget in route
+                                length units.  [default: 1e-08]
+    --read-cells INTEGER        Maximum raster cell slots per window read and
+                                in the bounded cell cache.  [default: 4096]
     --sequence / --no-sequence  Write a LF-delimited sequence of texts
                                 containing individual objects or write a single
                                 JSON text containing a feature collection object
@@ -87,6 +95,15 @@ for performing zonal statistics and point_queries at the command line.
                                 /draft-ietf-json-text-sequence-13 (default is
                                 False).
     -h, --help                  Show this message and exit.
+
+With ``--exposure`` the point sampler is replaced by continuous along-line
+exposure analysis (see :doc:`manual`): instead of one record per input
+feature, the command emits one GeoJSON Feature per classified segment
+(``above``, ``below`` or ``missing``), each clipped from the original route
+with intermediate turns preserved and carrying ``feature_index``,
+``part_index``, ``start``, ``stop``, ``kind`` and ``integral``. Missing
+segments are emitted with a null integral; output JSON never contains NaN or
+Infinity tokens.
 
 
 Example
