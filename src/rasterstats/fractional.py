@@ -32,6 +32,8 @@ from affine import Affine
 from rasterio import features
 from shapely.geometry import Polygon
 
+from rasterstats.io import read_validity
+
 #: Statistics supported by the fractional coverage mode.
 FRACTIONAL_STATS = ("count", "sum", "mean")
 
@@ -283,20 +285,11 @@ def _validity_mask(fsrc):
     """Boolean mask of cells that carry no usable observation.
 
     Dataset masks, explicit nodata, NaN and +/- infinity all invalidate a
-    cell.  Legitimate zeros stay valid.
+    cell.  Legitimate zeros stay valid.  The shared read layer reports the
+    complete mask; directly constructed rasters fall back to the same
+    composition used elsewhere.
     """
-    array = fsrc.array
-    if np.ma.is_masked(array):
-        invalid = np.ma.getmaskarray(array).copy()
-        data = np.ma.getdata(array)
-    else:
-        invalid = np.zeros(array.shape, dtype=bool)
-        data = array
-    if fsrc.nodata is not None:
-        invalid = invalid | (data == fsrc.nodata)
-    if np.issubdtype(data.dtype, np.floating):
-        invalid = invalid | ~np.isfinite(data)
-    return invalid, data
+    return read_validity(fsrc)
 
 
 def _empty_result(stats, coverage_area=0.0):

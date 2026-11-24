@@ -40,7 +40,7 @@ for performing zonal statistics and point_queries at the command line.
                                     cells read/held per tile.  [default: 65536]
     --indent INTEGER
     --info / --no-info
-    --nodata INTEGER
+    --nodata NUMBER
     --prefix TEXT
     --stats TEXT
     --sequence / --no-sequence      Write a LF-delimited sequence of texts
@@ -74,7 +74,7 @@ for performing zonal statistics and point_queries at the command line.
     --version                   Show the version and exit.
     -r, --raster PATH           [required]
     --band INTEGER
-    --nodata INTEGER
+    --nodata NUMBER
     --indent INTEGER
     --interpolate TEXT
     --property-name TEXT

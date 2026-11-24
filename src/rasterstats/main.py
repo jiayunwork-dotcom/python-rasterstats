@@ -17,7 +17,13 @@ from rasterstats.fractional import (
     validate_max_cells,
     validate_polygonal,
 )
-from rasterstats.io import DEFAULT_CHUNK_SIZE, Raster, read_features
+from rasterstats.io import (
+    DEFAULT_CHUNK_SIZE,
+    Raster,
+    nodata_matches,
+    read_features,
+    read_validity,
+)
 from rasterstats.utils import (
     boxify_points,
     check_stats,
@@ -345,24 +351,23 @@ def _ordinary_feature_stats(
     # rasterized geometry
     rv_array = rasterize_geom(geom, like=fsrc, all_touched=all_touched)
 
-    # nodata mask
-    isnodata = fsrc.array == fsrc.nodata
-
-    # add nan mask (if necessary)
-    has_nan = np.issubdtype(fsrc.array.dtype, np.floating) and np.isnan(
-        fsrc.array.min()
-    )
-    if has_nan:
-        isnodata = isnodata | np.isnan(fsrc.array)
+    # Complete validity from the shared read layer: dataset/MaskedArray
+    # masks, the effective numeric marker, NaN/inf and off-extent slots.
+    invalid, data = read_validity(fsrc)
 
     # Mask the source data array
     # mask everything that is not a valid value or not within our geom
-    masked = np.ma.MaskedArray(fsrc.array, mask=(isnodata | ~rv_array))
+    masked = np.ma.MaskedArray(data, mask=(invalid | ~rv_array))
 
     # If we're on 64 bit platform and the array is an integer type
-    # make sure we cast to 64 bit to avoid overflow for certain numpy ops
+    # make sure we cast to 64 bit to avoid overflow for certain numpy ops.
+    # Unsigned magnitudes above int64 (e.g. uint64 > 2**63) must accumulate
+    # as uint64 so they are not reinterpreted as negative values.
     if sys.maxsize > 2**32 and issubclass(masked.dtype.type, np.integer):
-        accum_dtype = "int64"
+        if masked.dtype.kind == "u" and masked.dtype.itemsize >= 8:
+            accum_dtype = "uint64"
+        else:
+            accum_dtype = "int64"
     else:
         accum_dtype = None  # numpy default
 
@@ -444,14 +449,26 @@ def _ordinary_feature_stats(
             feature_stats[pctile] = float(np.percentile(pctarr, q))
 
     if "nodata" in stats or "nan" in stats:
-        featmasked = np.ma.MaskedArray(fsrc.array, mask=(~rv_array))
+        # Diagnostics count cells inside the zone, but are independent of
+        # dataset/MaskedArray masks (those may overlap the counts).  Only
+        # real in-extent source cells qualify: the numeric marker for
+        # ``nodata`` and stored NaN (not infinity) for ``nan``.
+        in_bounds = getattr(fsrc, "in_bounds_mask", None)
+        if in_bounds is None:
+            in_bounds = np.ones(fsrc.array.shape, dtype=bool)
+        region = rv_array & in_bounds
 
         if "nodata" in stats:
-            feature_stats["nodata"] = float((featmasked == fsrc.nodata).sum())
+            hits = nodata_matches(data, fsrc.nodata) & region
+            feature_stats["nodata"] = float(np.count_nonzero(hits))
         if "nan" in stats:
-            feature_stats["nan"] = (
-                float(np.isnan(featmasked).sum()) if has_nan else 0
-            )
+            if np.issubdtype(data.dtype, np.floating) or np.issubdtype(
+                data.dtype, np.complexfloating
+            ):
+                nans = np.isnan(data) & region
+                feature_stats["nan"] = float(np.count_nonzero(nans))
+            else:
+                feature_stats["nan"] = 0.0
 
     if add_stats is not None:
         for stat_name, stat_func in add_stats.items():

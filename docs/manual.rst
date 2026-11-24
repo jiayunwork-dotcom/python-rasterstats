@@ -115,6 +115,74 @@ to a coordinate reference system::
     >>> zs = zonal_stats('tests/data/polygons.shp', array, affine=affine)
 
 
+Missing data and validity
+-------------------------
+
+Zonal statistics and point queries share one read layer and therefore one
+definition of an observation. A cell is an **observation** unless it is
+
+* equal to the effective numeric nodata marker for this call,
+* NaN or +/- infinity (always invalid, for floating-point rasters),
+* hidden by an independent dataset, alpha, or caller-supplied
+  ``MaskedArray`` mask, or
+* outside the raster extent (when ``boundless`` reads are enabled, padded
+  window slots are invalid and are never confused with a real cell).
+
+Everything else is observed, including zero, negative numbers, and values
+that merely *look* like a marker (such as ``-999``) when no marker applies.
+
+Which numeric marker applies is decided per call:
+
+* For an ``ndarray`` source no marker is implied. Only an explicit ``nodata``
+  argument declares one; without it, every finite cell is observed.
+* For a file source, an explicit ``nodata`` argument replaces the file's
+  declared NODATA value. When the argument is omitted the file's own NODATA
+  is used.
+
+Overriding the marker replaces the old *numeric* meaning. A mask the file
+derived solely from its old NODATA value is dropped along with it, but a
+genuinely independent dataset or alpha mask, and any ``MaskedArray`` mask the
+caller supplied, remain in force. This is why overriding ``nodata`` does not
+erase masked cells that were never derived from the numeric marker:
+
+.. code-block:: python
+
+    # File declares NODATA=-99, with an independent dataset mask at (1, 1).
+    # Overriding nodata=2 makes the old -99 cells observations again, but
+    # the independent mask at (1, 1) is still missing.
+    zonal_stats(polygon, "both.tif", nodata=2)
+
+The effective marker is compared exactly against the source dtype. A marker
+outside the dtype's representable range (for example ``-999`` against
+``uint8``) matches nothing; it is never truncated, wrapped, or allowed to
+invalidate a different value. Integer markers larger than ``2**53`` keep
+their exact identity, and reading never converts the source to float or
+drops the original integer dtype. Only the current window is materialized,
+so repeated small-window reads allocate work proportional to the window,
+not to the size of the source or its mask.
+
+Zonal statistics (``count``, ``sum``, ``mean``, ``min``/``max``, categorical
+counts, ``add_stats`` and ``zone_func``) consume exactly this validity from
+the shared read result, together with the rasterized zone mask. Cells outside
+the geometry are not observations either.
+
+The ``nodata`` diagnostic counts cells inside the zone that hit this call's
+numeric marker; the ``nan`` diagnostic counts stored NaN cells inside the
+zone. Neither counts padded window slots, and neither treats an independent
+mask or an infinity as the other statistic. Both diagnostics may overlap
+independent masks. When a zone has no observations at all, ordinary
+statistics keep their empty-result convention (``count`` is ``0``, other
+requested statistics are ``None``).
+
+Point queries follow the same validity. ``nearest`` returns ``None`` for an
+invalid cell. ``bilinear`` interpolates only when all four supporting cells
+are observations; otherwise it keeps the original nearest-neighbour fallback:
+the nearest supporting cell's value when that cell is valid, else ``None``.
+A zero-weight invalid cell therefore cannot contaminate a result located
+exactly at the centre of a valid cell, and a padded or zero-filled cell never
+enters the interpolation.
+
+
 Zonal Statistics
 ----------------
 

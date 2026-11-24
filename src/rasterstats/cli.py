@@ -10,6 +10,37 @@ from rasterstats._version import __version__ as version
 SETTINGS = dict(help_option_names=["-h", "--help"])
 
 
+class NodataType(click.ParamType):
+    """Accept either an integer or a floating-point nodata literal.
+
+    Integer literals stay integers so markers larger than 2**53 keep their
+    exact identity; anything else is parsed as a float (so small fractional
+    markers work).  Omitting the option still means "use the file's own
+    declaration".
+    """
+
+    name = "nodata"
+
+    def convert(self, value, param, ctx):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return value
+        text = str(value).strip()
+        try:
+            return int(text, 10)
+        except ValueError:
+            pass
+        try:
+            number = float(text)
+        except ValueError:
+            self.fail(f"{value!r} is not a valid number", param, ctx)
+        return number
+
+
+NODATA = NodataType()
+
+
 @click.command(context_settings=SETTINGS)
 @cligj.features_in_arg
 @click.version_option(version=version, message="%(version)s")
@@ -39,7 +70,7 @@ SETTINGS = dict(help_option_names=["-h", "--help"])
 )
 @click.option("--indent", type=int, default=None)
 @click.option("--info/--no-info", default=False)
-@click.option("--nodata", type=int, default=None)
+@click.option("--nodata", type=NODATA, default=None)
 @click.option("--prefix", type=str, default="_")
 @click.option("--stats", type=str, default=None)
 @click.option("--sequence/--no-sequence", type=bool, default=False)
@@ -100,9 +131,9 @@ def zonalstats(
         geojson_out=True,
     )
 
-    # Fractional mode never emits NaN/Infinity by construction (mean is null),
-    # but pin the serializer anyway so the JSON contract stays explicit.
-    json_default = dict(ignore_nan=True) if coverage == "fractional" else {}
+    # Never emit non-standard JSON literals (NaN/Infinity): they are replaced
+    # with null, matching the Python-side "no observation" value.
+    json_default = dict(ignore_nan=True)
 
     if sequence:
         for feature in zonal_results:
@@ -123,7 +154,7 @@ def zonalstats(
 @click.version_option(version=version, message="%(version)s")
 @click.option("--raster", "-r", required=True)
 @click.option("--band", type=int, default=1)
-@click.option("--nodata", type=int, default=None)
+@click.option("--nodata", type=NODATA, default=None)
 @click.option("--indent", type=int, default=None)
 @click.option("--interpolate", type=str, default="bilinear")
 @click.option("--property-name", type=str, default="value")
@@ -159,6 +190,11 @@ def pointquery(
         for feature in results:
             if use_rs:
                 click.echo(b"\x1e", nl=False)
-            click.echo(json.dumps(feature))
+            click.echo(json.dumps(feature, ignore_nan=True))
     else:
-        click.echo(json.dumps({"type": "FeatureCollection", "features": list(results)}))
+        click.echo(
+            json.dumps(
+                {"type": "FeatureCollection", "features": list(results)},
+                ignore_nan=True,
+            )
+        )

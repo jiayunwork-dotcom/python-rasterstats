@@ -1,8 +1,14 @@
-from numpy.ma import masked
+import numpy as np
 from shapely.geometry import shape
 from shapely.ops import transform
 
-from rasterstats.io import DEFAULT_CHUNK_SIZE, Raster, read_features
+from rasterstats.io import DEFAULT_CHUNK_SIZE, Raster, read_features, read_validity
+
+
+def _window_invalid(rast):
+    """Invalidity mask of a read result, including any masked-array mask."""
+    invalid, _ = read_validity(rast)
+    return invalid
 
 
 def point_window_unitxy(x, y, affine):
@@ -26,6 +32,34 @@ def point_window_unitxy(x, y, affine):
     return new_win, unitxy
 
 
+def _cell_invalid(arr):
+    """Boolean mask of unusable cells in a 2x2 support.
+
+    A masked array contributes its own mask; NaN and +/- infinity are always
+    invalid; a plain numeric array has no other implicit missingness.
+    """
+    if np.ma.isMaskedArray(arr):
+        invalid = np.ma.getmaskarray(arr)
+    else:
+        invalid = np.zeros(np.shape(arr), dtype=bool)
+    data = np.ma.getdata(arr)
+    if data.dtype.kind in "fc":
+        invalid = invalid | ~np.isfinite(data)
+    return np.asarray(invalid, dtype=bool)
+
+
+def _nearest_cell(arr, x, y):
+    """Original nearest-neighbour fallback within the 2x2 support."""
+    value = np.ma.getdata(arr)[round(1 - y), round(x)]
+    if _cell_invalid(arr)[round(1 - y), round(x)]:
+        return None
+    if np.ma.isMaskedArray(value):
+        return value.item()
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
 def bilinear(arr, x, y):
     """Given a 2x2 array, an x, and y, treat center points as a unit square
     return the value for the fractional row/col
@@ -38,23 +72,27 @@ def bilinear(arr, x, y):
         +---+---+
 
         e.g.: Center of A is at (0, 1) on unit square, D is at (1, 0), etc
+
+    Interpolation uses all four cells only when all four are observations.
+    Otherwise the original nearest-neighbour fallback applies: the nearest
+    cell's value when it is valid, else ``None``.  A zero-weight NaN or a
+    padded cell therefore never contributes to an otherwise valid centre
+    point.
     """
     # for now, only 2x2 arrays
     assert arr.shape == (2, 2)
-    ulv, urv, llv, lrv = arr[0:2, 0:2].flatten().tolist()
+    data = np.ma.getdata(arr)
 
     # not valid if not on unit square
     assert 0.0 <= x <= 1.0
     assert 0.0 <= y <= 1.0
 
-    if hasattr(arr, "count") and arr.count() != 4:
-        # a masked array with at least one nodata
+    if _cell_invalid(arr).any():
+        # at least one nodata/masked/non-finite support cell
         # fall back to nearest neighbor
-        val = arr[round(1 - y), round(x)]
-        if val is masked:
-            return None
-        else:
-            return val.item()
+        return _nearest_cell(arr, x, y)
+
+    ulv, urv, llv, lrv = data[0:2, 0:2].flatten().tolist()
 
     # bilinear interp on unit square
     return (
@@ -194,21 +232,20 @@ def gen_point_query(
                 if interpolate == "nearest":
                     r, c = rast.index(x, y)
                     window = ((int(r), int(r + 1)), (int(c), int(c + 1)))
-                    src_array = rast.read(
+                    result = rast.read(
                         window=window, masked=True, boundless=boundless
-                    ).array
-                    val = src_array[0, 0]
-                    if val is masked:
+                    )
+                    if _window_invalid(result)[0, 0]:
                         vals.append(None)
                     else:
-                        vals.append(val.item())
+                        vals.append(np.ma.getdata(result.array)[0, 0].item())
 
                 elif interpolate == "bilinear":
                     window, unitxy = point_window_unitxy(x, y, rast.affine)
-                    src_array = rast.read(
+                    result = rast.read(
                         window=window, masked=True, boundless=boundless
-                    ).array
-                    vals.append(bilinear(src_array, *unitxy))
+                    )
+                    vals.append(bilinear(result.array, *unitxy))
 
             if len(vals) == 1:
                 vals = vals[0]  # flatten single-element lists

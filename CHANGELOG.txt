@@ -1,4 +1,25 @@
 Unreleased
+- Unify missing-data handling between zonal statistics and point queries
+    - The shared raster read layer now preserves each source dtype and carries
+      a complete validity mask (independent dataset/alpha and MaskedArray
+      masks, the effective numeric marker, NaN/infinity, and off-extent slots).
+    - An explicit `nodata` replaces only the file's numeric marker (and masks
+      derived solely from it); independent masks and caller MaskedArray masks
+      stay in force. ndarrays imply no marker without an explicit `nodata`.
+    - Markers are compared exactly per dtype: out-of-range markers match
+      nothing, integer identities above 2**53 are preserved, and values are
+      never converted to float.
+    - `Raster.read` and ordinary zonal stats agree on count/sum/mean/min/max,
+      categorical counts, `add_stats`/`zone_func` masks, and the `nodata`/`nan`
+      diagnostics; all-invalid zones keep the empty-result convention.
+    - `nearest` returns `None` for invalid cells; `bilinear` interpolates only
+      when all four support cells are valid, otherwise it keeps the original
+      nearest fallback. Zero-weight invalid cells no longer contaminate a
+      result at a valid cell's centre.
+    - `rio zonalstats`/`rio pointquery` accept fractional `--nodata` values
+      while keeping large integer markers exact, and emit strict JSON (no
+      NaN/Infinity) in both collection and sequence output.
+    - Small-window reads allocate work proportional to the window only.
 - Add fractional area-weighted zonal statistics (#330)
     - New `coverage='fractional'` mode for `zonal_stats`/`gen_zonal_stats`
       with required `value_kind='total'` (whole-cell quantities) or
